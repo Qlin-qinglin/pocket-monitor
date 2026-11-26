@@ -5,5 +5,5 @@ internal object UsbStream {
         System.loadLibrary("pocket_usb")
     }
 
-    external fun clearHalt(fd: Int, endpointAddress: Int): Int
+    external fun connectionSpeed(fd: Int): Int
 }

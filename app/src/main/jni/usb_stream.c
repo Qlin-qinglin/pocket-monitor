@@ -4,14 +4,13 @@
 #include <sys/ioctl.h>
 
 JNIEXPORT jint JNICALL
-Java_com_qlinqinglin_pocketmonitor_UsbStream_clearHalt(
-        JNIEnv *env, jobject instance, jint fd, jint endpoint_address) {
+Java_com_qlinqinglin_pocketmonitor_UsbStream_connectionSpeed(
+        JNIEnv *env, jobject instance, jint fd) {
     (void)env;
     (void)instance;
-    unsigned int endpoint = (unsigned int)endpoint_address;
     int result;
     do {
-        result = ioctl(fd, USBDEVFS_CLEAR_HALT, &endpoint);
+        result = ioctl(fd, USBDEVFS_GET_SPEED, 0);
     } while (result < 0 && errno == EINTR);
-    return result < 0 ? -errno : 0;
+    return result < 0 ? -errno : result;
 }

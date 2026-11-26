@@ -13,7 +13,6 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -63,10 +62,10 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private var operation = 0
     private var starting = false
     private var reconnecting = false
-    private var reopened = false
-    private var lastWorking: Size? = null
-    private var recoverTo: Size? = null
-    private var automatic = ArrayDeque<Size>()
+    private var waitingMode: Size? = null
+    private var previousDeviceName: String? = null
+    private var previousMode: Size? = null
+    private var usbLink = "未读取"
     private var device: UsbDevice? = null
     private var deviceLabel = "未连接"
     private var modes = emptyList<Size>()
@@ -95,15 +94,12 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             frames = 0
             period = now
             if (opened && now - maxOf(lastFrame, previewStarted) >= 4000) {
-                if (total < 2 && (automatic.isNotEmpty() || recoverTo != null)) {
-                    note("首帧超时：${active?.let(::label) ?: "未知模式"}")
-                    if (!recoverPreviousMode()) startNextMode()
-                    main.postDelayed(this, 1000)
-                    return
+                val message = if (total < 2) "该模式未出画，请选新模式后重新插卡" else "未收到新画面"
+                if (status != message) {
+                    note("无新帧：${active?.let(::label) ?: "未知模式"}")
+                    setStatus(message)
+                    showControls(true)
                 }
-                val message = if (reopened && total < 2) "重连后仍无画面，请拔插采集卡" else "未收到新画面"
-                if (status != message) setStatus(message)
-                showControls(true)
             }
             refresh()
             main.postDelayed(this, 1000)
@@ -166,34 +162,45 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun onDeviceOpen(usb: UsbDevice, control: USBMonitor.UsbControlBlock, first: Boolean) {
                 if (!current(usb) || starting || modes.isNotEmpty()) return
-                val deferred = if (expected == null && isMs2130(usb)) takeDeferredMode(usb) else null
-                val target = preferred ?: deferred
+                val deferred = if (expected == null) takeDeferredMode(usb) else null
+                val previous = previousMode.takeIf { previousDeviceName == usb.deviceName }
+                val target = preferred ?: deferred ?: previous
                 if (deferred != null) note("应用预约模式 ${label(deferred)}")
                 setStatus("正在读取采集模式")
                 beginOperation(id) { token ->
                     usbControl = control
+                    val link = readUsbLink(usb, control.fileDescriptor)
                     val param = target?.let { UVCParam(it, 0) } ?: UVCParam()
                     val uvc = UVCCamera(param)
                     camera = uvc
                     val result = uvc.open(control)
                     check(result == 0) { "UVC open 返回 $result" }
-                    val supported = expandModes(uvc.supportedSizeList.orEmpty())
-                    check(supported.isNotEmpty()) { "UVC 未报告支持的视频模式" }
+                    val reported = expandModes(uvc.supportedSizeList.orEmpty())
+                    val supported = if (isMs2130(usb) && link.superspeed == false) {
+                        reported.filter {
+                            it.type == UVCCamera.UVC_VS_FRAME_MJPEG &&
+                                (it.width != 1920 || it.height != 1080 || it.fps <= 50)
+                        }
+                    } else reported
+                    check(supported.isNotEmpty()) { "当前 USB 链路无可用的视频模式" }
                     main.post {
                         if (session == id && operation == token) {
                             starting = false
                             modes = supported
-                            automatic = if (target == null) {
-                                automaticModes(supported)
+                            usbLink = link.description
+                            note("USB 链路 $usbLink")
+                            waitingMode = if (target == null) {
+                                preferredMode(supported, link.superspeed == true)
                             } else {
-                                ArrayDeque(supported.filter { key(it) == key(target) })
+                                supported.firstOrNull { key(it) == key(target) }
                             }
-                            if (automatic.isEmpty()) {
-                                note("重新读取后未找到 ${target?.let(::label)}")
-                                if (!recoverPreviousMode()) setStatus("该模式已不可用，请重新选择")
+                            if (waitingMode == null) {
+                                requested = target
+                                note("当前 USB 链路未报告 ${target?.let(::label)}")
+                                setStatus("该模式在当前 USB 链路不可用，请选择模式并重新插卡")
                                 return@post
                             }
-                            startNextMode()
+                            startPendingPreview()
                         }
                     }
                 }
@@ -205,7 +212,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun onDetach(usb: UsbDevice) {
                 if (!current(usb) && !(session == id && expected == usb)) return
-                if (isMs2130(usb)) getPreferences(MODE_PRIVATE).edit().remove("deferredDevice").apply()
+                getPreferences(MODE_PRIVATE).let { preferences ->
+                    if (preferences.getString("deferredDevice", null) == usb.deviceName) {
+                        preferences.edit().remove("deferredDevice").apply()
+                    }
+                }
+                previousDeviceName = null
+                previousMode = null
                 note("采集卡已拔出")
                 disconnect()
                 showControls(true)
@@ -219,9 +232,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             override fun onError(usb: UsbDevice, error: USBMonitor.USBException) {
                 if (!current(usb)) return
                 note("USB 错误 ${error.message.orEmpty()}")
-                if (!recoverPreviousMode()) {
-                    setStatus(if (reopened) "USB 重连失败，请拔插采集卡" else "USB 连接失败，请重连")
-                }
+                setStatus("USB 连接失败，请重连或拔插采集卡")
             }
         }, main)
         monitor = usbMonitor
@@ -251,7 +262,8 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private fun takeDeferredMode(usb: UsbDevice): Size? {
         val preferences = getPreferences(MODE_PRIVATE)
-        if (preferences.getString("deferredDevice", null) == usb.deviceName) return null
+        if (preferences.getString("deferredVidPid", null) != usbModelKey(usb) ||
+            preferences.getString("deferredDevice", null) == usb.deviceName) return null
         val values = preferences.getString("deferredMode", null)?.split(',')?.mapNotNull(String::toIntOrNull)
         if (values?.size != 4) return null
         clearDeferredMode()
@@ -259,76 +271,55 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         return Size(type, width, height, fps, listOf(fps))
     }
 
-    private fun resetVideoEndpoints(usb: UsbDevice): String {
-        val interfaces = (0 until usb.interfaceCount).map(usb::getInterface)
+    private fun usbModelKey(usb: UsbDevice) = "${usb.vendorId}:${usb.productId}"
+
+    private data class UsbLink(val superspeed: Boolean?, val description: String)
+
+    private fun readUsbLink(usb: UsbDevice, fd: Int): UsbLink {
+        val speed = try {
+            UsbStream.connectionSpeed(fd)
+        } catch (_: UnsatisfiedLinkError) {
+            0
+        }
+        when (speed) {
+            1 -> return UsbLink(false, "Low-Speed · 1.5 Mb/s")
+            2 -> return UsbLink(false, "Full-Speed · 12 Mb/s")
+            3 -> return UsbLink(false, "USB 2.0 High-Speed · 480 Mb/s")
+            5 -> return UsbLink(true, "USB 3.x SuperSpeed · 5 Gb/s")
+            6 -> return UsbLink(true, "USB 3.x SuperSpeedPlus")
+        }
+        val packet = (0 until usb.interfaceCount).asSequence().map(usb::getInterface)
             .filter { it.interfaceClass == UsbConstants.USB_CLASS_VIDEO && it.interfaceSubclass == 2 }
-            .groupBy { it.id }
-        if (interfaces.isEmpty()) return "UVC 复位：未发现视频流接口"
-        return try {
-            val manager = getSystemService(UsbManager::class.java)
-            val connection = manager.openDevice(usb) ?: return "UVC 复位：无法打开设备"
-            try {
-                interfaces.values.joinToString("; ", "UVC 复位：") { alternatives ->
-                    val idle = alternatives.firstOrNull { it.alternateSetting == 0 }
-                        ?: return@joinToString "接口 ${alternatives.first().id} 缺少 alt 0"
-                    if (!connection.claimInterface(idle, false)) return@joinToString "接口 ${idle.id} 无法占用"
-                    try {
-                        val selected = connection.setInterface(idle)
-                        val bulkIn = (0 until idle.endpointCount).map(idle::getEndpoint).filter {
-                            it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_IN
-                        }
-                        val results = bulkIn.joinToString { endpoint ->
-                            val result = UsbStream.clearHalt(connection.fileDescriptor, endpoint.address)
-                            "0x${endpoint.address.toString(16)}=$result"
-                        }
-                        "接口 ${idle.id} alt0=$selected，bulk IN ${results.ifEmpty { "无" }}"
-                    } finally {
-                        connection.releaseInterface(idle)
-                    }
-                }
-            } finally {
-                connection.close()
-            }
-        } catch (error: Exception) {
-            "UVC 复位失败：${error.message ?: error.javaClass.simpleName}"
-        } catch (error: UnsatisfiedLinkError) {
-            "UVC 复位库加载失败"
+            .flatMap { iface -> (0 until iface.endpointCount).asSequence().map(iface::getEndpoint) }
+            .filter { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_IN }
+            .maxOfOrNull { it.maxPacketSize }
+        return when (packet) {
+            1024 -> UsbLink(true, "USB 3.x（视频 Bulk 端点 1024 B；ioctl=$speed）")
+            512 -> UsbLink(false, "USB 2.0（视频 Bulk 端点 512 B；ioctl=$speed）")
+            else -> UsbLink(null, "未知（ioctl=$speed）")
         }
     }
 
-    private fun automaticModes(supported: List<Size>): ArrayDeque<Size> {
-        val preferences = listOf(
-            Triple(1920, 1080, 60), Triple(1920, 1080, 50), Triple(1920, 1080, 30),
-            Triple(1280, 720, 30)
-        )
-        val jpeg = supported.filter { it.type == UVCCamera.UVC_VS_FRAME_MJPEG }
-        val candidates = preferences.mapNotNull { (width, height, rate) ->
-            jpeg.firstOrNull { it.width == width && it.height == height && it.fps == rate }
-        }
-        return ArrayDeque(candidates.ifEmpty { listOf(jpeg.firstOrNull() ?: supported.first()) })
+    private fun preferredMode(supported: List<Size>, superspeed: Boolean): Size {
+        val format = if (superspeed) UVCCamera.UVC_VS_FRAME_UNCOMPRESSED else UVCCamera.UVC_VS_FRAME_MJPEG
+        return supported.minWith(compareBy<Size>(
+            { abs(it.width - 1920) + abs(it.height - 1080) },
+            { if (it.type == format) 0 else 1 },
+            { -it.fps }
+        ))
     }
 
-    private fun startNextMode() {
+    private fun startPendingPreview() {
         if (starting || texture.surfaceTexture == null) return
-        automatic.removeFirstOrNull()?.let(::openMode)
+        val size = waitingMode ?: return
+        waitingMode = null
+        openMode(size)
     }
 
-    private fun recoverPreviousMode(): Boolean {
-        val mode = recoverTo ?: return false
-        recoverTo = null
-        note("恢复上次出画模式 ${label(mode)}")
-        reconnect(mode)
-        return true
-    }
-
-    private fun reconnect(mode: Size?, fallback: Size? = null) {
+    private fun reconnect() {
         val expected = device
-        val previous = lastWorking
+        val mode = requested
         disconnect()
-        lastWorking = previous
-        recoverTo = fallback
-        reopened = expected != null
-        requested = mode
         reconnecting = true
         val id = session
         setStatus("正在重建 USB 会话")
@@ -337,11 +328,9 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         }, 7000)
         // The cleanup queued by disconnect() must complete before reopening the device.
         streamWorker.post {
-            val reset = expected?.takeIf(::isMs2130)?.let(::resetVideoEndpoints)
             main.post {
                 if (session == id && foreground) {
                     reconnecting = false
-                    reset?.let(::note)
                     connect(mode, expected)
                 }
             }
@@ -367,12 +356,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
                         starting = false
                         showControls(true)
                         note("UVC 错误：${error.message ?: error.javaClass.simpleName}")
-                        if (!recoverPreviousMode()) {
-                            val message = if (reopened && modes.isEmpty()) "USB 重连失败，请拔插采集卡"
-                                else "采集卡打开失败，请切换模式或重连"
-                            setStatus(message)
-                            startNextMode()
-                        }
+                        setStatus("采集卡打开失败，请选模式后重新插卡")
                     }
                 }
             }
@@ -386,6 +370,8 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         opened = false
         active = null
         requested = size
+        previousDeviceName = device?.deviceName
+        previousMode = size
         frames = 0
         total = 0
         fps = 0.0
@@ -439,15 +425,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         device = null
         deviceLabel = "未连接"
         modes = emptyList()
-        automatic.clear()
+        waitingMode = null
+        usbLink = "未读取"
         active = null
         requested = null
         opened = false
         starting = false
         reconnecting = false
-        reopened = false
-        lastWorking = null
-        recoverTo = null
         lastFrame = 0
         frames = 0
         total = 0
@@ -481,44 +465,38 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun chooseMode() {
-        val id = session
+        val current = device ?: return
         val choices = modes
         if (choices.isEmpty()) return
-        AlertDialog.Builder(this).setTitle("采集模式")
-            .setSingleChoiceItems(choices.map(::label).toTypedArray(), choices.indexOfFirst { key(it) == active?.let(::key) }) { dialog, index ->
+        val preferences = getPreferences(MODE_PRIVATE)
+        val queued = preferences.getString("deferredMode", null)
+            .takeIf { preferences.getString("deferredVidPid", null) == usbModelKey(current) }
+        val checked = choices.indexOfFirst {
+            if (queued != null) key(it).joinToString(",") == queued else key(it) == requested?.let(::key)
+        }
+        AlertDialog.Builder(this).setTitle("采集模式 · 重新插卡后生效")
+            .setSingleChoiceItems(choices.map(::label).toTypedArray(), checked) { dialog, index ->
                 dialog.dismiss()
-                if (id != session || starting) return@setSingleChoiceItems
+                if (device != current || starting) return@setSingleChoiceItems
                 val selected = choices[index]
-                if (key(selected) == active?.let(::key) && status == "正在监看") return@setSingleChoiceItems
-                val fallback = lastWorking?.takeUnless { key(it) == key(selected) }
-                val currentDevice = device
-                if (currentDevice != null && isMs2130(currentDevice) && status == "正在监看") {
-                    AlertDialog.Builder(this).setTitle(label(selected))
-                        .setNegativeButton("取消", null)
-                        .setNeutralButton("拔插后应用") { _, _ ->
-                            if (id == session) {
-                                getPreferences(MODE_PRIVATE).edit()
-                                    .putString("deferredDevice", currentDevice.deviceName)
-                                    .putString("deferredMode", key(selected).joinToString(","))
-                                    .apply()
-                                note("已预约拔插后应用 ${label(selected)}")
-                                Toast.makeText(this, "下次插入采集卡时应用", Toast.LENGTH_SHORT).show()
-                            }
-                        }.setPositiveButton("立即切换") { _, _ ->
-                            if (id == session) {
-                                clearDeferredMode()
-                                reconnect(selected, fallback)
-                            }
-                        }.show()
-                } else {
-                    clearDeferredMode()
-                    reconnect(selected, fallback)
-                }
+                preferences.edit()
+                    .putString("deferredDevice", current.deviceName)
+                    .putString("deferredVidPid", usbModelKey(current))
+                    .putString("deferredMode", key(selected).joinToString(","))
+                    .apply()
+                note("已预约拔插后应用 ${label(selected)}")
+                refresh()
+                Toast.makeText(this, "已选择 ${label(selected)}，重新插卡后生效", Toast.LENGTH_SHORT).show()
+            }.setNeutralButton("恢复自动") { _, _ ->
+                clearDeferredMode()
+                refresh()
+                Toast.makeText(this, "下次插卡将按 USB 链路自动选档", Toast.LENGTH_SHORT).show()
             }.setNegativeButton("关闭", null).show()
     }
 
     private fun clearDeferredMode() {
-        getPreferences(MODE_PRIVATE).edit().remove("deferredDevice").remove("deferredMode").apply()
+        getPreferences(MODE_PRIVATE).edit().remove("deferredDevice")
+            .remove("deferredVidPid").remove("deferredMode").apply()
     }
 
     private fun note(message: String) {
@@ -541,14 +519,18 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         empty.visibility = if (status == "正在监看") View.GONE else View.VISIBLE
         modeButton.isEnabled = modes.isNotEmpty() && !starting
+        val preferences = getPreferences(MODE_PRIVATE)
+        val queued = device?.let { preferences.getString("deferredVidPid", null) == usbModelKey(it) } == true
+        modeButton.text = if (queued) "采集模式 · 已预约" else "采集模式"
     }
 
     private fun rate() = String.format(Locale.ROOT, "%.1f", fps)
 
     private fun captureReport(): String = buildString {
-            appendLine("掌上监看 0.1.4")
+            appendLine("掌上监看 0.1.5")
             appendLine("${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
             appendLine("USB VID:PID $deviceLabel")
+            appendLine("USB 链路 $usbLink")
             appendLine("状态 $status")
             appendLine("请求 ${requested?.let(::label) ?: "自动"}")
             appendLine("当前 ${active?.let(::label) ?: "—"}")
@@ -574,7 +556,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         transform()
-        startNextMode()
+        startPendingPreview()
         connect()
     }
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = transform()
@@ -590,9 +572,6 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         total++
         lastFrame = SystemClock.elapsedRealtime()
         if (total >= 2 && status != "正在监看") {
-            automatic.clear()
-            recoverTo = null
-            lastWorking = active
             setStatus("正在监看")
         }
     }
@@ -672,7 +651,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             action("复位画面", ::resetZoom)
             action("重连") {
                 permissionPrompt = false
-                reconnect(lastWorking)
+                reconnect()
             }
             action("诊断报告", ::diagnostics)
         }
