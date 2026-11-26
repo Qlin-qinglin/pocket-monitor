@@ -8,5 +8,9 @@ local.properties
 *.apk
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.key
 *.log
 .env*
