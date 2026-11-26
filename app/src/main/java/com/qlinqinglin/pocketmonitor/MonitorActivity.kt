@@ -12,6 +12,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -64,6 +65,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private var reopened = false
     private var lastWorking: Size? = null
     private var recoverTo: Size? = null
+    private var nextMs2130Mode: Pair<String, Size>? = null
     private var automatic = ArrayDeque<Size>()
     private var device: UsbDevice? = null
     private var deviceLabel = "未连接"
@@ -164,10 +166,16 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun onDeviceOpen(usb: UsbDevice, control: USBMonitor.UsbControlBlock, first: Boolean) {
                 if (!current(usb) || starting || modes.isNotEmpty()) return
+                val deferred = nextMs2130Mode?.takeIf {
+                    expected == null && isMs2130(usb) && usb.deviceName != it.first
+                }?.second
+                if (deferred != null) nextMs2130Mode = null
+                val target = preferred ?: deferred
                 setStatus("正在读取采集模式")
                 beginOperation(id) { token ->
                     usbControl = control
-                    val param = preferred?.let { UVCParam(it, 0) } ?: UVCParam()
+                    // Use the same initial probe that produced a picture on physical attachment.
+                    val param = if (isMs2130(usb)) UVCParam() else target?.let { UVCParam(it, 0) } ?: UVCParam()
                     val uvc = UVCCamera(param)
                     camera = uvc
                     val result = uvc.open(control)
@@ -178,15 +186,18 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
                         if (session == id && operation == token) {
                             starting = false
                             modes = supported
-                            automatic = if (preferred == null) {
+                            automatic = if (target == null) {
                                 automaticModes(supported)
                             } else {
-                                ArrayDeque(supported.filter { key(it) == key(preferred) })
+                                ArrayDeque(supported.filter { key(it) == key(target) })
                             }
                             if (automatic.isEmpty()) {
-                                note("重连后未找到 ${preferred?.let(::label)}")
+                                note("重新读取后未找到 ${target?.let(::label)}")
                                 if (!recoverPreviousMode()) setStatus("该模式已不可用，请重新选择")
                                 return@post
+                            }
+                            if (deferred != null) {
+                                recoverTo = automaticModes(supported).firstOrNull()?.takeUnless { key(it) == key(deferred) }
                             }
                             startNextMode()
                         }
@@ -241,6 +252,24 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun isVideo(usb: UsbDevice) =
         usb.deviceClass == 14 || (0 until usb.interfaceCount).any { usb.getInterface(it).interfaceClass == 14 }
 
+    private fun isMs2130(usb: UsbDevice) = usb.vendorId == 0x345F && usb.productId == 0x2130
+
+    private fun reapplyUsbConfiguration(usb: UsbDevice): String {
+        if (usb.configurationCount != 1) return "跳过 USB 配置重设：设备没有唯一配置"
+        return try {
+            val manager = getSystemService(UsbManager::class.java)
+            val connection = manager.openDevice(usb) ?: return "USB 配置重设：无法打开设备"
+            try {
+                val applied = connection.setConfiguration(usb.getConfiguration(0))
+                if (applied) "USB 配置重设成功" else "系统未接受 USB 配置重设"
+            } finally {
+                connection.close()
+            }
+        } catch (error: Exception) {
+            "USB 配置重设失败：${error.message ?: error.javaClass.simpleName}"
+        }
+    }
+
     private fun automaticModes(supported: List<Size>): ArrayDeque<Size> {
         val preferences = listOf(
             Triple(1920, 1080, 60), Triple(1920, 1080, 50), Triple(1920, 1080, 30),
@@ -282,9 +311,11 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         }, 7000)
         // The cleanup queued by disconnect() must complete before reopening the device.
         streamWorker.post {
+            val reset = expected?.takeIf(::isMs2130)?.let(::reapplyUsbConfiguration)
             main.post {
                 if (session == id && foreground) {
                     reconnecting = false
+                    reset?.let(::note)
                     connect(mode, expected)
                 }
             }
@@ -434,7 +465,26 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
                 val selected = choices[index]
                 if (key(selected) == active?.let(::key) && status == "正在监看") return@setSingleChoiceItems
                 val fallback = lastWorking?.takeUnless { key(it) == key(selected) }
-                reconnect(selected, fallback)
+                val currentDevice = device
+                if (currentDevice != null && isMs2130(currentDevice) && status == "正在监看") {
+                    AlertDialog.Builder(this).setTitle(label(selected))
+                        .setNegativeButton("取消", null)
+                        .setNeutralButton("拔插后应用") { _, _ ->
+                            if (id == session) {
+                                nextMs2130Mode = currentDevice.deviceName to selected
+                                note("已预约拔插后应用 ${label(selected)}")
+                                Toast.makeText(this, "下次插入采集卡时应用", Toast.LENGTH_SHORT).show()
+                            }
+                        }.setPositiveButton("立即切换") { _, _ ->
+                            if (id == session) {
+                                nextMs2130Mode = null
+                                reconnect(selected, fallback)
+                            }
+                        }.show()
+                } else {
+                    nextMs2130Mode = null
+                    reconnect(selected, fallback)
+                }
             }.setNegativeButton("关闭", null).show()
     }
 
@@ -463,7 +513,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun rate() = String.format(Locale.ROOT, "%.1f", fps)
 
     private fun captureReport(): String = buildString {
-            appendLine("掌上监看 0.1.2")
+            appendLine("掌上监看 0.1.3")
             appendLine("${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
             appendLine("USB VID:PID $deviceLabel")
             appendLine("状态 $status")
