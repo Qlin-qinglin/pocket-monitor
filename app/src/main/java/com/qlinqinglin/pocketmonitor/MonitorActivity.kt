@@ -11,6 +11,7 @@ import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
@@ -65,7 +66,6 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private var reopened = false
     private var lastWorking: Size? = null
     private var recoverTo: Size? = null
-    private var nextMs2130Mode: Pair<String, Size>? = null
     private var automatic = ArrayDeque<Size>()
     private var device: UsbDevice? = null
     private var deviceLabel = "未连接"
@@ -166,16 +166,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun onDeviceOpen(usb: UsbDevice, control: USBMonitor.UsbControlBlock, first: Boolean) {
                 if (!current(usb) || starting || modes.isNotEmpty()) return
-                val deferred = nextMs2130Mode?.takeIf {
-                    expected == null && isMs2130(usb) && usb.deviceName != it.first
-                }?.second
-                if (deferred != null) nextMs2130Mode = null
+                val deferred = if (expected == null && isMs2130(usb)) takeDeferredMode(usb) else null
                 val target = preferred ?: deferred
+                if (deferred != null) note("应用预约模式 ${label(deferred)}")
                 setStatus("正在读取采集模式")
                 beginOperation(id) { token ->
                     usbControl = control
-                    // Use the same initial probe that produced a picture on physical attachment.
-                    val param = if (isMs2130(usb)) UVCParam() else target?.let { UVCParam(it, 0) } ?: UVCParam()
+                    val param = target?.let { UVCParam(it, 0) } ?: UVCParam()
                     val uvc = UVCCamera(param)
                     camera = uvc
                     val result = uvc.open(control)
@@ -196,9 +193,6 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
                                 if (!recoverPreviousMode()) setStatus("该模式已不可用，请重新选择")
                                 return@post
                             }
-                            if (deferred != null) {
-                                recoverTo = automaticModes(supported).firstOrNull()?.takeUnless { key(it) == key(deferred) }
-                            }
                             startNextMode()
                         }
                     }
@@ -211,6 +205,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun onDetach(usb: UsbDevice) {
                 if (!current(usb) && !(session == id && expected == usb)) return
+                if (isMs2130(usb)) getPreferences(MODE_PRIVATE).edit().remove("deferredDevice").apply()
                 note("采集卡已拔出")
                 disconnect()
                 showControls(true)
@@ -254,19 +249,50 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private fun isMs2130(usb: UsbDevice) = usb.vendorId == 0x345F && usb.productId == 0x2130
 
-    private fun reapplyUsbConfiguration(usb: UsbDevice): String {
-        if (usb.configurationCount != 1) return "跳过 USB 配置重设：设备没有唯一配置"
+    private fun takeDeferredMode(usb: UsbDevice): Size? {
+        val preferences = getPreferences(MODE_PRIVATE)
+        if (preferences.getString("deferredDevice", null) == usb.deviceName) return null
+        val values = preferences.getString("deferredMode", null)?.split(',')?.mapNotNull(String::toIntOrNull)
+        if (values?.size != 4) return null
+        clearDeferredMode()
+        val (type, width, height, fps) = values
+        return Size(type, width, height, fps, listOf(fps))
+    }
+
+    private fun resetVideoEndpoints(usb: UsbDevice): String {
+        val interfaces = (0 until usb.interfaceCount).map(usb::getInterface)
+            .filter { it.interfaceClass == UsbConstants.USB_CLASS_VIDEO && it.interfaceSubclass == 2 }
+            .groupBy { it.id }
+        if (interfaces.isEmpty()) return "UVC 复位：未发现视频流接口"
         return try {
             val manager = getSystemService(UsbManager::class.java)
-            val connection = manager.openDevice(usb) ?: return "USB 配置重设：无法打开设备"
+            val connection = manager.openDevice(usb) ?: return "UVC 复位：无法打开设备"
             try {
-                val applied = connection.setConfiguration(usb.getConfiguration(0))
-                if (applied) "USB 配置重设成功" else "系统未接受 USB 配置重设"
+                interfaces.values.joinToString("; ", "UVC 复位：") { alternatives ->
+                    val idle = alternatives.firstOrNull { it.alternateSetting == 0 }
+                        ?: return@joinToString "接口 ${alternatives.first().id} 缺少 alt 0"
+                    if (!connection.claimInterface(idle, false)) return@joinToString "接口 ${idle.id} 无法占用"
+                    try {
+                        val selected = connection.setInterface(idle)
+                        val bulkIn = (0 until idle.endpointCount).map(idle::getEndpoint).filter {
+                            it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_IN
+                        }
+                        val results = bulkIn.joinToString { endpoint ->
+                            val result = UsbStream.clearHalt(connection.fileDescriptor, endpoint.address)
+                            "0x${endpoint.address.toString(16)}=$result"
+                        }
+                        "接口 ${idle.id} alt0=$selected，bulk IN ${results.ifEmpty { "无" }}"
+                    } finally {
+                        connection.releaseInterface(idle)
+                    }
+                }
             } finally {
                 connection.close()
             }
         } catch (error: Exception) {
-            "USB 配置重设失败：${error.message ?: error.javaClass.simpleName}"
+            "UVC 复位失败：${error.message ?: error.javaClass.simpleName}"
+        } catch (error: UnsatisfiedLinkError) {
+            "UVC 复位库加载失败"
         }
     }
 
@@ -311,7 +337,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         }, 7000)
         // The cleanup queued by disconnect() must complete before reopening the device.
         streamWorker.post {
-            val reset = expected?.takeIf(::isMs2130)?.let(::reapplyUsbConfiguration)
+            val reset = expected?.takeIf(::isMs2130)?.let(::resetVideoEndpoints)
             main.post {
                 if (session == id && foreground) {
                     reconnecting = false
@@ -471,25 +497,32 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
                         .setNegativeButton("取消", null)
                         .setNeutralButton("拔插后应用") { _, _ ->
                             if (id == session) {
-                                nextMs2130Mode = currentDevice.deviceName to selected
+                                getPreferences(MODE_PRIVATE).edit()
+                                    .putString("deferredDevice", currentDevice.deviceName)
+                                    .putString("deferredMode", key(selected).joinToString(","))
+                                    .apply()
                                 note("已预约拔插后应用 ${label(selected)}")
                                 Toast.makeText(this, "下次插入采集卡时应用", Toast.LENGTH_SHORT).show()
                             }
                         }.setPositiveButton("立即切换") { _, _ ->
                             if (id == session) {
-                                nextMs2130Mode = null
+                                clearDeferredMode()
                                 reconnect(selected, fallback)
                             }
                         }.show()
                 } else {
-                    nextMs2130Mode = null
+                    clearDeferredMode()
                     reconnect(selected, fallback)
                 }
             }.setNegativeButton("关闭", null).show()
     }
 
+    private fun clearDeferredMode() {
+        getPreferences(MODE_PRIVATE).edit().remove("deferredDevice").remove("deferredMode").apply()
+    }
+
     private fun note(message: String) {
-        if (history.size == 20) history.removeFirst()
+        if (history.size == 32) history.removeFirst()
         history.addLast(message)
     }
 
@@ -513,7 +546,7 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun rate() = String.format(Locale.ROOT, "%.1f", fps)
 
     private fun captureReport(): String = buildString {
-            appendLine("掌上监看 0.1.3")
+            appendLine("掌上监看 0.1.4")
             appendLine("${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
             appendLine("USB VID:PID $deviceLabel")
             appendLine("状态 $status")
