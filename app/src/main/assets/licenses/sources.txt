@@ -1,0 +1,4 @@
+UVCAndroid 1.0.13 and its native dependencies
+Source and build scripts: https://github.com/shiyinghan/UVCAndroid
+Upstream native sources: libuvccamera/src/main/jni
+The APK packages the native libraries separately as shared objects.
