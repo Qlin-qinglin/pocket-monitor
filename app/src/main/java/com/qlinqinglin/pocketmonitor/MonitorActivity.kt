@@ -15,11 +15,13 @@ import android.hardware.usb.UsbDevice
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.ScaleGestureDetector
 import android.view.TextureView
 import android.view.View
@@ -31,11 +33,10 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import com.herohan.uvcapp.CameraException
-import com.herohan.uvcapp.CameraHelper
-import com.herohan.uvcapp.ICameraHelper
 import com.serenegiant.usb.Size
+import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.UVCCamera
+import com.serenegiant.usb.UVCParam
 import com.serenegiant.utils.UVCUtils
 import java.util.Locale
 import kotlin.math.abs
@@ -50,7 +51,16 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var empty: TextView
     private lateinit var modeButton: Button
 
-    private var helper: CameraHelper? = null
+    private val streamThread = HandlerThread("pocket-uvc")
+    private lateinit var streamWorker: Handler
+    // Access these USB resources only on streamWorker.
+    private var camera: UVCCamera? = null
+    private var usbControl: USBMonitor.UsbControlBlock? = null
+    private var monitor: USBMonitor? = null
+    private var session = 0
+    private var operation = 0
+    private var starting = false
+    private var automatic = ArrayDeque<Size>()
     private var device: UsbDevice? = null
     private var deviceLabel = "未连接"
     private var modes = emptyList<Size>()
@@ -78,7 +88,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             fps = frames * 1000.0 / (now - period).coerceAtLeast(1)
             frames = 0
             period = now
-            if (opened && now - maxOf(lastFrame, previewStarted) >= 3000) {
+            if (opened && now - maxOf(lastFrame, previewStarted) >= 4000) {
+                if (total < 2 && automatic.isNotEmpty()) {
+                    note("首帧超时：${active?.let(::label) ?: "未知模式"}")
+                    startNextMode()
+                    main.postDelayed(this, 1000)
+                    return
+                }
                 if (status != "未收到新画面") {
                     setStatus("未收到新画面")
                     showControls(true)
@@ -92,6 +108,8 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         UVCUtils.init(application)
+        streamThread.start()
+        streamWorker = Handler(streamThread.looper)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         buildScreen()
         fullscreen()
@@ -118,8 +136,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         super.onStop()
     }
 
+    override fun onDestroy() {
+        streamThread.quitSafely()
+        super.onDestroy()
+    }
+
     private fun connect() {
-        if (!foreground || helper != null) return
+        if (!foreground || monitor != null) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             setStatus("请授予相机权限，以读取 USB 采集卡")
             if (!permissionPrompt) {
@@ -128,53 +151,39 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             }
             return
         }
-        val camera = CameraHelper()
-        helper = camera
-        setStatus("等待 USB 采集卡")
-        camera.setStateCallback(object : ICameraHelper.StateCallback {
-            private fun current(usb: UsbDevice) = helper === camera && device == usb
+        val id = session
+        val usbMonitor = USBMonitor(applicationContext, object : USBMonitor.OnDeviceConnectListener {
+            private fun current(usb: UsbDevice) = session == id && device == usb
 
             override fun onAttach(usb: UsbDevice) {
-                if (helper === camera) select(camera, usb)
+                if (session == id) select(usb)
             }
 
-            override fun onDeviceOpen(usb: UsbDevice, first: Boolean) {
+            override fun onDeviceOpen(usb: UsbDevice, control: USBMonitor.UsbControlBlock, first: Boolean) {
                 if (!current(usb)) return
                 setStatus("正在读取采集模式")
-                camera.openCamera()
-            }
-
-            override fun onCameraOpen(usb: UsbDevice) {
-                if (!current(usb)) return
-                val size = camera.previewSize
-                val supported = camera.supportedSizeList.orEmpty()
-                modes = expandModes(supported)
-                if (requested == null) {
-                    val preferred = modes.firstOrNull()
-                    if (preferred != null && key(preferred) != size?.let(::key)) {
-                        openMode(camera, preferred)
-                        return
+                beginOperation(id) { token ->
+                    usbControl = control
+                    val uvc = UVCCamera(UVCParam())
+                    camera = uvc
+                    val result = uvc.open(control)
+                    check(result == 0) { "UVC open 返回 $result" }
+                    val supported = expandModes(uvc.supportedSizeList.orEmpty())
+                    check(supported.isNotEmpty()) { "UVC 未报告支持的视频模式" }
+                    main.post {
+                        if (session == id && operation == token) {
+                            starting = false
+                            modes = supported
+                            automatic = automaticModes(supported)
+                            startNextMode()
+                        }
                     }
                 }
-                requested?.let {
-                    if (key(it) != size?.let(::key)) note("实际模式与请求不同")
-                }
-                active = size
-                size?.let { aspect = it.width.toFloat() / it.height }
-                transform()
-                opened = true
-                frames = 0
-                total = 0
-                lastFrame = 0
-                lastTextureTimestamp = Long.MIN_VALUE
-                previewStarted = SystemClock.elapsedRealtime()
-                setStatus("等待 HDMI 画面")
-                camera.startPreview()
-                texture.surfaceTexture?.let { camera.addSurface(it, false) }
             }
 
-            override fun onCameraClose(usb: UsbDevice) = Unit
-            override fun onDeviceClose(usb: UsbDevice) = Unit
+            override fun onDeviceClose(usb: UsbDevice, control: USBMonitor.UsbControlBlock) {
+                if (current(usb)) setStatus("USB 连接已关闭")
+            }
 
             override fun onDetach(usb: UsbDevice) {
                 if (!current(usb)) return
@@ -185,63 +194,145 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             }
 
             override fun onCancel(usb: UsbDevice) {
-                if (!current(usb)) return
-                setStatus("USB 授权已取消，请点重连")
+                if (current(usb)) setStatus("USB 授权已取消，请点重连")
             }
 
-            override fun onError(usb: UsbDevice, error: CameraException) {
+            override fun onError(usb: UsbDevice, error: USBMonitor.USBException) {
                 if (!current(usb)) return
-                opened = false
-                showControls(true)
-                note("UVC 错误 ${error.code} ${error.message.orEmpty()}")
-                setStatus("采集卡打开失败，请切换模式或重连")
+                note("USB 错误 ${error.message.orEmpty()}")
+                setStatus("USB 连接失败，请重连")
             }
-        })
-        camera.deviceList.orEmpty().firstOrNull(::isVideo)?.let { select(camera, it) }
+        }, main)
+        monitor = usbMonitor
+        setStatus("等待 USB 采集卡")
+        usbMonitor.register()
+        usbMonitor.deviceList.firstOrNull(::isVideo)?.let(::select)
     }
 
-    private fun select(camera: CameraHelper, usb: UsbDevice) {
+    private fun select(usb: UsbDevice) {
         if (device != null || !isVideo(usb)) return
         device = usb
         deviceLabel = String.format(Locale.ROOT, "%04X:%04X", usb.vendorId, usb.productId)
         note("USB 设备 $deviceLabel")
         setStatus("等待 USB 授权")
-        camera.selectDevice(usb)
+        monitor?.requestPermission(usb)
     }
 
     private fun isVideo(usb: UsbDevice) =
         usb.deviceClass == 14 || (0 until usb.interfaceCount).any { usb.getInterface(it).interfaceClass == 14 }
 
-    private fun openMode(camera: CameraHelper, size: Size) {
-        if (opened) texture.surfaceTexture?.let(camera::removeSurface)
+    private fun automaticModes(supported: List<Size>): ArrayDeque<Size> {
+        val preferences = listOf(
+            Triple(1920, 1080, 60), Triple(1920, 1080, 50), Triple(1920, 1080, 30),
+            Triple(1280, 720, 30)
+        )
+        val jpeg = supported.filter { it.type == UVCCamera.UVC_VS_FRAME_MJPEG }
+        val candidates = preferences.mapNotNull { (width, height, rate) ->
+            jpeg.firstOrNull { it.width == width && it.height == height && it.fps == rate }
+        }
+        return ArrayDeque(candidates.ifEmpty { listOf(jpeg.firstOrNull() ?: supported.first()) })
+    }
+
+    private fun startNextMode() {
+        if (starting || texture.surfaceTexture == null) return
+        automatic.removeFirstOrNull()?.let(::openMode)
+    }
+
+    private fun beginOperation(id: Int, block: (Int) -> Unit) {
+        val token = ++operation
+        starting = true
+        refresh()
+        main.postDelayed({
+            if (session == id && operation == token && starting) {
+                setStatus("采集卡响应超时，请拔插或重连")
+                showControls(true)
+            }
+        }, 7000)
+        streamWorker.post {
+            try {
+                block(token)
+            } catch (error: Exception) {
+                main.post {
+                    if (session == id && operation == token) {
+                        starting = false
+                        showControls(true)
+                        note("UVC 错误：${error.message ?: error.javaClass.simpleName}")
+                        setStatus("采集卡打开失败，请切换模式或重连")
+                        startNextMode()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openMode(size: Size) {
+        val target = texture.surfaceTexture ?: return
+        if (starting) return
+        val id = session
         opened = false
         active = null
         requested = size
+        frames = 0
+        total = 0
         fps = 0.0
+        lastFrame = 0
+        lastTextureTimestamp = target.timestamp
         setStatus("正在打开 ${label(size)}")
-        camera.closeCamera()
-        camera.openCamera(size)
+        beginOperation(id) { token ->
+            val uvc = checkNotNull(camera)
+            uvc.stopPreview()
+            uvc.setPreviewSize(size)
+            val surface = Surface(target)
+            try {
+                uvc.setPreviewDisplay(surface)
+            } finally {
+                surface.release()
+            }
+            uvc.startPreview()
+            main.post {
+                if (session == id && operation == token) {
+                    starting = false
+                    active = size
+                    aspect = size.width.toFloat() / size.height
+                    transform()
+                    opened = true
+                    previewStarted = SystemClock.elapsedRealtime()
+                    setStatus("等待 HDMI 画面")
+                }
+            }
+        }
     }
 
     private fun disconnect() {
         if (device != null) {
             getPreferences(MODE_PRIVATE).edit().putString("lastCapture", captureReport()).apply()
         }
-        val camera = helper
-        helper = null
+        session++
+        val usbMonitor = monitor
+        monitor = null
+        // Stop dispatching USB events immediately, but close the native camera first.
+        usbMonitor?.unregister()
+        streamWorker.post {
+            try {
+                camera?.destroy(true)
+            } finally {
+                camera = null
+                usbControl?.close(true)
+                usbControl = null
+                usbMonitor?.destroy()
+            }
+        }
         device = null
         deviceLabel = "未连接"
         modes = emptyList()
+        automatic.clear()
         active = null
         requested = null
         opened = false
+        starting = false
         lastFrame = 0
         frames = 0
         fps = 0.0
-        if (camera != null) {
-            texture.surfaceTexture?.let(camera::removeSurface)
-            camera.release()
-        }
     }
 
     override fun onRequestPermissionsResult(request: Int, permissions: Array<out String>, grants: IntArray) {
@@ -271,13 +362,16 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun chooseMode() {
-        val camera = helper ?: return
+        val id = session
         val choices = modes
         if (choices.isEmpty()) return
         AlertDialog.Builder(this).setTitle("采集模式")
             .setSingleChoiceItems(choices.map(::label).toTypedArray(), choices.indexOfFirst { key(it) == active?.let(::key) }) { dialog, index ->
                 dialog.dismiss()
-                if (camera === helper && key(choices[index]) != active?.let(::key)) openMode(camera, choices[index])
+                if (id == session && !starting) {
+                    automatic.clear()
+                    openMode(choices[index])
+                }
             }.setNegativeButton("关闭", null).show()
     }
 
@@ -300,13 +394,13 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             else -> status
         }
         empty.visibility = if (status == "正在监看") View.GONE else View.VISIBLE
-        modeButton.isEnabled = modes.isNotEmpty()
+        modeButton.isEnabled = modes.isNotEmpty() && !starting
     }
 
     private fun rate() = String.format(Locale.ROOT, "%.1f", fps)
 
     private fun captureReport(): String = buildString {
-            appendLine("掌上监看 0.1.0")
+            appendLine("掌上监看 0.1.1")
             appendLine("${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
             appendLine("USB VID:PID $deviceLabel")
             appendLine("状态 $status")
@@ -314,7 +408,8 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
             appendLine("当前 ${active?.let(::label) ?: "—"}")
             appendLine("显示帧率 ${rate()} fps / 本次显示帧数 $total")
             appendLine("可选模式 ${modes.size}")
-            modes.forEach { appendLine(label(it)) }
+            modes.take(12).forEach { appendLine(label(it)) }
+            if (modes.size > 12) appendLine("其余模式可在采集模式菜单查看")
             appendLine("本次会话")
             history.forEach { appendLine(it) }
     }
@@ -333,11 +428,12 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         transform()
-        if (opened) helper?.addSurface(surface, false)
+        startNextMode()
+        connect()
     }
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = transform()
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-        if (opened) helper?.removeSurface(surface)
+        if (monitor != null) disconnect()
         return true
     }
 
@@ -347,7 +443,10 @@ class MonitorActivity : Activity(), TextureView.SurfaceTextureListener {
         frames++
         total++
         lastFrame = SystemClock.elapsedRealtime()
-        if (status != "正在监看") setStatus("正在监看")
+        if (total >= 2 && status != "正在监看") {
+            automatic.clear()
+            setStatus("正在监看")
+        }
     }
 
     private fun transform() {
